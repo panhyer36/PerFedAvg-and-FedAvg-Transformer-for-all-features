@@ -12,8 +12,6 @@
 - 生成詳細的性能報告和可視化結果
 - 保存測試結果到 CSV 文件便於後續分析
 
-Author: Federated Learning Research Team
-Date: 2025-07
 """
 
 import os
