@@ -1,0 +1,75 @@
+# 联邦学习配置
+federated_learning:
+  algorithm: "per_fedavg"  # 联邦学习算法: "fedavg" or "per_fedavg"
+  global_rounds: 100   # 全局训练轮数
+  client_fraction: 0.1 # 每轮参与训练的客户端比例
+  num_clients: 51      # 总客户端数量：50个Consumer + 1个Public Building
+  eval_interval: 10    # 评估间隔
+  
+  # Per-FedAvg 专用配置
+  per_fedavg:
+    meta_step_size: 0.01    # 元学习步长 (α)
+    use_second_order: false # 是否使用二階梯度 (HVP) - true: HVP版本, false: First-Order版本
+    hvp_damping: 0.01       # HVP阻尼係數，提高數值穩定性（僅在use_second_order=true時生效）
+
+# 本地训练配置
+local_training:
+  local_epochs: 8      # 本地训练轮数
+  learning_rate: 0.0005  # 学习率
+  batch_size: 32       # 批次大小
+
+# 模型配置
+model:
+  feature_dim: 25      # 特征维度 (对应features列表中的16个特征)
+  d_model: 256         # Transformer模型维度
+  nhead: 8             # 注意力头数
+  num_layers: 4        # Transformer层数
+  output_dim: 1        # 输出维度
+  max_seq_length: 100  # 最大序列长度
+  dropout: 0.1         # Dropout率
+
+# 数据配置
+data:
+  data_path: "data/processed"
+  input_length: 96     # 输入序列长度
+  output_length: 1     # 输出序列长度
+  features: ['AC1', 'AC2', 'AC3', 'AC4', 'Dish washer', 'Washing Machine', 'Dryer', 'Water heater', 'TV', 'Microwave', 'Kettle', 'Lighting', 'Refrigerator', 'Consumption_Total', 'Generation_Total', 'TemperatureC', 'DewpointC', 'PressurehPa', 'WindSpeedKMH', 'WindSpeedGustKMH', 'Humidity', 'HourlyPrecipMM', 'dailyrainMM', 'SolarRadiationWatts_m2', 'Power_Demand']  # 输入特征
+  target: ["Power_Demand"]    # 目标特征
+  train_ratio: 0.8     # 训练集比例
+  val_ratio: 0.1       # 验证集比例
+  test_ratio: 0.1      # 测试集比例
+
+# 训练配置
+training:
+  max_epochs: 200      # 最大训练轮数
+  early_stopping:
+    patience: 15       # 早停耐心值
+    min_delta: 0.001   # 最小改善阈值
+  lr_scheduler:
+    patience: 3        # 学习率调度器耐心值
+    factor: 0.7        # 学习率衰减因子
+    min_lr: 0.000001       # 最小学习率
+
+# 设备配置 (可选设备: cuda, mps, cpu)
+device:
+  type: "auto"         # 自动选择设备类型: "cuda", "mps", "cpu"
+
+# 日志配置
+logging:
+  log_interval: 100    # 日志记录间隔
+  save_model: true     # 是否保存模型
+  model_save_path: "checkpoints"
+  log_level: "INFO"
+
+# 测试配置
+testing:
+  personalization_steps: 3    # Per-FedAvg 个性化适应步数
+  support_ratio: 0.2          # Support set 比例 (用于个性化适应)
+  adaptation_lr: 0.001        # 个性化适应学习率
+
+# 可视化配置
+visualization:
+  save_plots: true     # 是否保存图表
+  plot_path: "plots"   # 图表保存路径
+  show_attention: true # 是否显示注意力图
+  save_only: true      # 仅保存图表，不显示 (避免plt.show())
