@@ -331,66 +331,37 @@ class Client:
                 # 計算 ∇_θ L_D'(θ')，這實際上是二階梯度！
                 # 因為θ'本身就是θ的函數，所以這包含了二階信息
                 
-                # CUDA兼容性處理：在CUDA環境下禁用高效注意力機制
-                if self.device.type == 'cuda':
-                    try:
-                        # 嘗試使用舊版本API（更穩定）
-                        try:
-                            with torch.backends.cuda.sdp_kernel(
-                                enable_flash=False,      # 禁用FlashAttention
-                                enable_math=True,        # 使用標準數學實現
-                                enable_mem_efficient=False,  # 禁用內存高效實現
-                                enable_cudnn=False       # 禁用cuDNN實現
-                            ):
-                                hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False)
-                        except AttributeError:
-                            # 如果舊版本API不可用，嘗試新版本
-                            try:
-                                from torch.nn.attention import sdpa_kernel, SDPBackend
-                                # 新版本API：只使用MATH backend
-                                backends = [SDPBackend.MATH] if hasattr(SDPBackend, 'MATH') else None
-                                if backends:
-                                    with sdpa_kernel(backends=backends):
-                                        hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False)
-                                else:
-                                    # 無法設置特定backend，直接計算
-                                    hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False)
-                            except (ImportError, AttributeError, TypeError):
-                                # 新舊版本都不可用，直接計算
-                                hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False)
-                    except (AttributeError, RuntimeError) as e:
-                        # 如果遇到已知的CUDA注意力問題，回退到CPU計算
-                        if "derivative for aten::_scaled_dot_product_efficient_attention_backward is not implemented" in str(e):
-                            print(f"CUDA HVP計算失敗，回退到CPU計算...")
-                            
-                            # 將數據和模型臨時移到CPU
-                            original_device = next(self.model.parameters()).device
-                            self.model.cpu()
-                            inputs_d_prime_cpu = inputs_d_prime.cpu()
-                            labels_d_prime_cpu = labels_d_prime.cpu()
-                            updated_params_cpu = [p.cpu() for p in updated_params]
-                            params_cpu = [p.cpu() for p in params]
-                            
-                            # 在CPU上計算HVP
-                            loss_d_prime_cpu = self._functional_forward(inputs_d_prime_cpu, labels_d_prime_cpu, updated_params_cpu)
-                            hvp_grads_cpu = torch.autograd.grad(loss_d_prime_cpu, params_cpu, retain_graph=False)
-                            
-                            # 將結果移回原設備
-                            hvp_grads = [g.to(original_device) for g in hvp_grads_cpu]
-                            self.model.to(original_device)
-                        else:
-                            # 其他未知錯誤，直接拋出
-                            raise e
-                else:
-                    # 非CUDA環境，正常計算
-                    hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False)
+                # HVP二階梯度計算：強制使用MATH backend避免高效注意力的二階導數問題
+                # 
+                # **根本原因**：PyTorch的FlashAttention和Memory-Efficient注意力機制
+                # 為了性能優化，沒有實現完整的二階梯度（double backward）支持
+                # 
+                # **官方解決方案**：使用MATH backend，這是唯一支持完整autograd的實現
+                # 參考：https://github.com/pytorch/pytorch/issues/116348
+                #      https://discuss.pytorch.org/t/runtimeerror-derivative-for-aten-scaled-dot-product-is-not-implemented/200233
+                
+                # 強制使用MATH backend進行HVP計算
+                try:
+                    # PyTorch 2.1+: 使用新版SDPBackend
+                    from torch.nn.attention import sdpa_kernel, SDPBackend
+                    with sdpa_kernel(SDPBackend.MATH):
+                        hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False, allow_unused=True)
+                except (ImportError, AttributeError, TypeError):
+                    # PyTorch 2.0+: 使用舊版API
+                    with torch.backends.cuda.sdp_kernel(
+                        enable_flash=False,           # 禁用FlashAttention
+                        enable_math=True,             # 啟用唯一支持二階梯度的MATH backend
+                        enable_mem_efficient=False,   # 禁用Memory-Efficient
+                        enable_cudnn=False            # 禁用cuDNN backend
+                    ):
+                        hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False, allow_unused=True)
                 
                 # === 步驟5：數值穩定性處理 ===
                 # 阻尼技術：添加小的正則項防止數值不穩定
                 # 類似於在Hessian矩陣對角線加上小值
                 if hvp_damping > 0:
                     hvp_grads = [
-                        grad + hvp_damping * param 
+                        grad + hvp_damping * param if grad is not None else None
                         for grad, param in zip(hvp_grads, params)
                     ]
                 
@@ -398,12 +369,14 @@ class Client:
                 optimizer.zero_grad()
                 
                 # 手動設置梯度：因為我們計算的是特殊的二階梯度
-                # 而不是標準的backward()產生的梯度
+                # 而不是標準的backward()產生的梯度  
                 for param, grad in zip(params, hvp_grads):
-                    if param.grad is None:
-                        param.grad = grad.detach()  # detach切斷計算圖避免內存洩漏
-                    else:
-                        param.grad.data = grad.detach()
+                    if grad is not None:  # 只處理非None的梯度
+                        if param.grad is None:
+                            param.grad = grad.detach()  # detach切斷計算圖避免內存洩漏
+                        else:
+                            param.grad.data = grad.detach()
+                    # 對於None梯度的參數，保持其梯度為None或零
                 
                 optimizer.step()
         
