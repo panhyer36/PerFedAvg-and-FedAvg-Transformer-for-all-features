@@ -313,12 +313,16 @@ class Client:
         """
         獲取支持二階梯度的注意力context manager
         
-        CUDA環境下，PyTorch的高效注意力實現不支持二階梯度，
-        必須使用MATH backend確保HVP計算正確。
+        只有CUDA環境下才需要特殊處理，因為CUDA的高效注意力實現不支持二階梯度。
+        MPS和CPU環境天然支持二階梯度計算，無需額外設置。
         
         Returns:
             context manager或None
         """
+        # 只在CUDA環境下才需要特殊的注意力backend設置
+        if self.device.type != 'cuda':
+            return None
+            
         try:
             # 優先使用新版API (PyTorch 2.1+)
             from torch.nn.attention import sdpa_kernel, SDPBackend
@@ -340,8 +344,9 @@ class Client:
         """
         計算Hessian-Vector Product梯度
         
-        使用MATH backend確保二階梯度計算的正確性。
-        整個HVP流程都需要在MATH backend context中執行。
+        設備特定處理：
+        - CUDA: 使用MATH backend避免高效注意力的二階梯度問題
+        - MPS/CPU: 直接計算，天然支持二階梯度
         
         Args:
             inputs_d: 支持集輸入
