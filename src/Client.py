@@ -258,26 +258,10 @@ class Client:
     
     def local_train_per_fedavg_hvp(self, global_model=None):
         """
-        Per-FedAvg HVP版本 (使用真正的二階梯度)
+        Per-FedAvg HVP版本：使用Hessian-Vector Product計算真正的二階梯度
         
-        **與First-Order版本的區別**：
-        First-Order版本使用近似來避免計算二階梯度，而HVP版本計算真正的二階梯度。
-        
-        **HVP (Hessian-Vector Product) 原理**：
-        - Hessian矩陣包含所有二階偏導數，描述損失函數的曲率信息
-        - 直接計算Hessian矩陣記憶體和計算成本過高（O(n²)）
-        - HVP技術只計算Hessian與向量的乘積，大幅降低複雜度至O(n)
-        
-        **二階梯度的優勢**：
-        1. 更準確的梯度信息：考慮損失函數的曲率
-        2. 更好的收斂性：避免在鞍點或平坦區域振盪
-        3. 更精確的元學習：更好地模擬真實的適應過程
-        
-        **計算流程**：
-        1. 在D上計算一階梯度 ∇L_D(θ)
-        2. 計算虛擬更新參數 θ' = θ - α∇L_D(θ)  
-        3. 計算L_D'(θ')對原始參數θ的梯度（這是二階梯度！）
-        4. 使用此梯度更新原始模型
+        HVP計算二階梯度信息，提供比First-Order近似更精確的元學習。
+        在CUDA環境下自動使用MATH backend確保二階梯度計算正確性。
         """
         if global_model is not None:
             self.model.load_state_dict(global_model.state_dict())
@@ -286,101 +270,114 @@ class Client:
         optimizer = Adam(self.model.parameters(), lr=self.args.beta, weight_decay=1e-4)
         
         # HVP算法參數
-        meta_lr = getattr(self.args, 'meta_step_size', 0.01)     # 元學習步長
-        hvp_damping = getattr(self.args, 'hvp_damping', 0.01)   # 數值穩定性阻尼
+        meta_lr = getattr(self.args, 'meta_step_size', 0.01)
+        hvp_damping = getattr(self.args, 'hvp_damping', 0.01)
         
-        # 本地訓練多個 epoch（與其他版本保持一致）
         for _ in range(self.args.tau):
             for inputs, labels in self.train_loader:
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
                 
-                # === 元學習數據分割 ===
+                # 元學習數據分割
                 if len(inputs) < 2:
-                    continue  # 批次太小無法分割，跳過
+                    continue
                 
                 split_idx = len(inputs) // 2
-                inputs_d, labels_d = inputs[:split_idx], labels[:split_idx]        # 支持集
-                inputs_d_prime, labels_d_prime = inputs[split_idx:], labels[split_idx:]  # 查詢集
+                inputs_d, labels_d = inputs[:split_idx], labels[:split_idx]
+                inputs_d_prime, labels_d_prime = inputs[split_idx:], labels[split_idx:]
                 
-                # 獲取當前模型參數（用於計算梯度）
+                # HVP梯度計算
                 params = list(self.model.parameters())
-                
-                # === 步驟1：計算支持集上的一階梯度（保持計算圖） ===
-                outputs_d = self.model(inputs_d)
-                loss_d = self.criterion(outputs_d, labels_d)
-                
-                # 關鍵：create_graph=True 保持計算圖用於後續二階梯度計算
-                # 這使得PyTorch能夠追蹤梯度的梯度
-                grads_d = torch.autograd.grad(
-                    loss_d, params, 
-                    create_graph=True,  # 保持計算圖：讓梯度可以進一步求導
-                    retain_graph=True   # 保留圖結構：允許多次backward
+                hvp_grads = self._compute_hvp_gradients(
+                    inputs_d, labels_d, inputs_d_prime, labels_d_prime, 
+                    params, meta_lr
                 )
                 
-                # === 步驟2：計算虛擬更新後的參數 ===
-                # 這裡不實際更新模型，而是計算如果更新後參數會是什麼
-                # θ' = θ - α∇L_D(θ)
-                updated_params = [p - meta_lr * g for p, g in zip(params, grads_d)]
-                
-                # === 步驟3：使用函數式API計算查詢集損失 ===
-                # 這是HVP的關鍵：使用虛擬更新的參數計算新的損失
-                # 由於updated_params仍在計算圖中，這個損失可以對原始參數求導
-                loss_d_prime = self._functional_forward(inputs_d_prime, labels_d_prime, updated_params)
-                
-                # === 步驟4：計算二階梯度（HVP的核心） ===
-                # 計算 ∇_θ L_D'(θ')，這實際上是二階梯度！
-                # 因為θ'本身就是θ的函數，所以這包含了二階信息
-                
-                # HVP二階梯度計算：強制使用MATH backend避免高效注意力的二階導數問題
-                # 
-                # **根本原因**：PyTorch的FlashAttention和Memory-Efficient注意力機制
-                # 為了性能優化，沒有實現完整的二階梯度（double backward）支持
-                # 
-                # **官方解決方案**：使用MATH backend，這是唯一支持完整autograd的實現
-                # 參考：https://github.com/pytorch/pytorch/issues/116348
-                #      https://discuss.pytorch.org/t/runtimeerror-derivative-for-aten-scaled-dot-product-is-not-implemented/200233
-                
-                # 強制使用MATH backend進行HVP計算
-                try:
-                    # PyTorch 2.1+: 使用新版SDPBackend
-                    from torch.nn.attention import sdpa_kernel, SDPBackend
-                    with sdpa_kernel(SDPBackend.MATH):
-                        hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False, allow_unused=True)
-                except (ImportError, AttributeError, TypeError):
-                    # PyTorch 2.0+: 使用舊版API
-                    with torch.backends.cuda.sdp_kernel(
-                        enable_flash=False,           # 禁用FlashAttention
-                        enable_math=True,             # 啟用唯一支持二階梯度的MATH backend
-                        enable_mem_efficient=False,   # 禁用Memory-Efficient
-                        enable_cudnn=False            # 禁用cuDNN backend
-                    ):
-                        hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False, allow_unused=True)
-                
-                # === 步驟5：數值穩定性處理 ===
-                # 阻尼技術：添加小的正則項防止數值不穩定
-                # 類似於在Hessian矩陣對角線加上小值
+                # 數值穩定性處理
                 if hvp_damping > 0:
                     hvp_grads = [
                         grad + hvp_damping * param if grad is not None else None
                         for grad, param in zip(hvp_grads, params)
                     ]
                 
-                # === 步驟6：使用二階梯度更新原始模型 ===
+                # 使用HVP梯度更新模型
                 optimizer.zero_grad()
-                
-                # 手動設置梯度：因為我們計算的是特殊的二階梯度
-                # 而不是標準的backward()產生的梯度  
                 for param, grad in zip(params, hvp_grads):
-                    if grad is not None:  # 只處理非None的梯度
-                        if param.grad is None:
-                            param.grad = grad.detach()  # detach切斷計算圖避免內存洩漏
-                        else:
-                            param.grad.data = grad.detach()
-                    # 對於None梯度的參數，保持其梯度為None或零
+                    if grad is not None:
+                        param.grad = grad.detach() if param.grad is None else grad.detach()
                 
                 optimizer.step()
         
         return self.model.state_dict()
+    
+    def _get_attention_context_manager(self):
+        """
+        獲取支持二階梯度的注意力context manager
+        
+        CUDA環境下，PyTorch的高效注意力實現不支持二階梯度，
+        必須使用MATH backend確保HVP計算正確。
+        
+        Returns:
+            context manager或None
+        """
+        try:
+            # 優先使用新版API (PyTorch 2.1+)
+            from torch.nn.attention import sdpa_kernel, SDPBackend
+            return sdpa_kernel(SDPBackend.MATH)
+        except (ImportError, AttributeError, TypeError):
+            try:
+                # 回退到舊版API (PyTorch 2.0+)
+                return torch.backends.cuda.sdp_kernel(
+                    enable_flash=False,
+                    enable_math=True,
+                    enable_mem_efficient=False,
+                    enable_cudnn=False
+                )
+            except (AttributeError, RuntimeError):
+                # 無法設置特定backend，返回None
+                return None
+    
+    def _compute_hvp_gradients(self, inputs_d, labels_d, inputs_d_prime, labels_d_prime, params, meta_lr):
+        """
+        計算Hessian-Vector Product梯度
+        
+        使用MATH backend確保二階梯度計算的正確性。
+        整個HVP流程都需要在MATH backend context中執行。
+        
+        Args:
+            inputs_d: 支持集輸入
+            labels_d: 支持集標籤  
+            inputs_d_prime: 查詢集輸入
+            labels_d_prime: 查詢集標籤
+            params: 模型參數列表
+            meta_lr: 元學習率
+            
+        Returns:
+            list: HVP梯度列表
+        """
+        def _hvp_computation():
+            # 步驟1: 計算支持集梯度
+            outputs_d = self.model(inputs_d)
+            loss_d = self.criterion(outputs_d, labels_d)
+            grads_d = torch.autograd.grad(
+                loss_d, params, create_graph=True, retain_graph=True
+            )
+            
+            # 步驟2: 虛擬參數更新
+            updated_params = [p - meta_lr * g for p, g in zip(params, grads_d)]
+            
+            # 步驟3: 查詢集損失計算
+            loss_d_prime = self._functional_forward(inputs_d_prime, labels_d_prime, updated_params)
+            
+            # 步驟4: 二階梯度計算
+            return torch.autograd.grad(loss_d_prime, params, retain_graph=False, allow_unused=True)
+        
+        # 使用MATH backend執行HVP計算
+        attention_ctx = self._get_attention_context_manager()
+        if attention_ctx is not None:
+            with attention_ctx:
+                return _hvp_computation()
+        else:
+            return _hvp_computation()
     
     def _functional_forward(self, inputs, labels, updated_params):
         """
