@@ -9,7 +9,7 @@ federated_learning:
   # Per-FedAvg 专用配置
   per_fedavg:
     meta_step_size: 0.01    # 元学习步长 (α)
-    use_second_order: false # 是否使用二階梯度 (HVP) - true: HVP版本, false: First-Order版本
+    use_second_order: true # 是否使用二階梯度 (HVP) - true: HVP版本, false: First-Order版本
     hvp_damping: 0.01       # HVP阻尼係數，提高數值穩定性（僅在use_second_order=true時生效）
 
 # 本地训练配置

@@ -330,7 +330,53 @@ class Client:
                 # === 步驟4：計算二階梯度（HVP的核心） ===
                 # 計算 ∇_θ L_D'(θ')，這實際上是二階梯度！
                 # 因為θ'本身就是θ的函數，所以這包含了二階信息
-                hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False)
+                
+                # CUDA兼容性處理：在CUDA環境下禁用高效注意力機制
+                if self.device.type == 'cuda':
+                    try:
+                        # 嘗試使用新版本的attention kernel API
+                        try:
+                            from torch.nn.attention import sdpa_kernel
+                            with sdpa_kernel(
+                                enable_flash=False,       # 禁用FlashAttention
+                                enable_math=True,         # 使用標準數學實現
+                                enable_mem_efficient=False  # 禁用內存高效實現
+                            ):
+                                hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False)
+                        except ImportError:
+                            # 回退到舊版本API
+                            with torch.backends.cuda.sdp_kernel(
+                                enable_flash=False,
+                                enable_math=True,
+                                enable_mem_efficient=False
+                            ):
+                                hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False)
+                    except (AttributeError, RuntimeError) as e:
+                        # 如果遇到已知的CUDA注意力問題，回退到CPU計算
+                        if "derivative for aten::_scaled_dot_product_efficient_attention_backward is not implemented" in str(e):
+                            print(f"CUDA HVP計算失敗，回退到CPU計算...")
+                            
+                            # 將數據和模型臨時移到CPU
+                            original_device = next(self.model.parameters()).device
+                            self.model.cpu()
+                            inputs_d_prime_cpu = inputs_d_prime.cpu()
+                            labels_d_prime_cpu = labels_d_prime.cpu()
+                            updated_params_cpu = [p.cpu() for p in updated_params]
+                            params_cpu = [p.cpu() for p in params]
+                            
+                            # 在CPU上計算HVP
+                            loss_d_prime_cpu = self._functional_forward(inputs_d_prime_cpu, labels_d_prime_cpu, updated_params_cpu)
+                            hvp_grads_cpu = torch.autograd.grad(loss_d_prime_cpu, params_cpu, retain_graph=False)
+                            
+                            # 將結果移回原設備
+                            hvp_grads = [g.to(original_device) for g in hvp_grads_cpu]
+                            self.model.to(original_device)
+                        else:
+                            # 其他未知錯誤，直接拋出
+                            raise e
+                else:
+                    # 非CUDA環境，正常計算
+                    hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False)
                 
                 # === 步驟5：數值穩定性處理 ===
                 # 阻尼技術：添加小的正則項防止數值不穩定
