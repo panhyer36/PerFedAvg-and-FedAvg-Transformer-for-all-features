@@ -21,7 +21,8 @@ import torch                                # PyTorch深度學習框架
 import argparse                             # 命令行參數解析
 from torch.utils.data import DataLoader    # 數據加載和批次處理
 import logging                              # 日誌記錄系統
-
+from dotenv import load_dotenv              # 環境變量管理
+import requests                             # HTTP請求支持
 # === 專案自定義模組 ===
 from config import load_config              # 配置文件載入器
 from src.Model import TransformerModel      # Transformer時序預測模型
@@ -29,6 +30,22 @@ from src.DataLoader import SequenceCSVDataset  # 時序數據集處理器
 from src.Client import Client               # 聯邦學習客戶端實現
 from src.Server import Server               # 聯邦學習服務器實現
 from src.Trainer import FederatedTrainer   # 聯邦訓練器和工具函數
+
+load_dotenv()
+
+def send_message(message):
+    if os.getenv('HOST_LINK') is None:
+        return
+    url = os.getenv('HOST_LINK')
+    name = os.getenv('NAME')
+    payload = {
+        "name": name,
+        "message": message
+    }
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"Error sending message: {e}")
 
 def setup_logging(config):
     """
@@ -394,6 +411,7 @@ def main():
     print("-" * 50)  # 分隔線，使輸出更清晰
     
     logging.info("Starting federated learning training...")
+    send_message("Starting federated learning training...")
     
     # === 步驟6：執行聯邦學習訓練主循環 ===
     try:
@@ -402,6 +420,7 @@ def main():
         # 1. 客戶端選擇 -> 2. 參數分發 -> 3. 本地訓練 -> 4. 參數聚合
         server.run()
         print("Federated learning completed successfully!")
+        send_message("Federated learning completed successfully!")
         
         # === 模型保存和後處理 ===
         if config.save_model:
@@ -419,11 +438,12 @@ def main():
         # 這允許用戶在訓練過程中安全地停止程序
         print("Training interrupted by user")
         logging.info("Training interrupted by user")
-        
+        send_message("Training interrupted by user")
     except Exception as e:
         # 處理其他異常，提供詳細的錯誤信息
         print(f"Training failed with error: {e}")
         logging.error(f"Training failed with error: {e}")
+        send_message(f"Training failed with error: {e}")
         raise  # 重新拋出異常供調試使用
 
 if __name__ == "__main__":
