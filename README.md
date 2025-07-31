@@ -23,6 +23,21 @@
 - PyTorch 2.0+
 - CUDA, MPS（可選，支持 GPU 加速）
 
+### 環境配置
+
+建立 `.env` 檔案設定環境變數：
+```bash
+# 複製環境變數範本
+cp .env.example .env
+
+# 編輯環境變數
+nano .env
+```
+
+`.env` 檔案包含：
+- **HOST_LINK**: 實驗通知webhook URL
+- **NAME**: 實驗名稱標識
+
 ### 安裝步驟
 
 1. **克隆項目**
