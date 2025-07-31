@@ -98,12 +98,8 @@ def load_config(config_path="config.yaml"):
     
     # 训练配置
     training_config = config_dict['training']
-    config.max_epochs = training_config['max_epochs']
     config.early_stopping_patience = training_config['early_stopping']['patience']
     config.early_stopping_min_delta = training_config['early_stopping']['min_delta']
-    config.lr_scheduler_patience = training_config['lr_scheduler']['patience']
-    config.lr_scheduler_factor = training_config['lr_scheduler']['factor']
-    config.lr_scheduler_min_lr = training_config['lr_scheduler']['min_lr']
     
     # 设备配置
     device_config = config_dict['device']
@@ -111,7 +107,6 @@ def load_config(config_path="config.yaml"):
     
     # 日志配置
     logging_config = config_dict['logging']
-    config.log_interval = logging_config['log_interval']
     config.save_model = logging_config['save_model']
     config.model_save_path = logging_config['model_save_path']
     config.log_level = logging_config['log_level']

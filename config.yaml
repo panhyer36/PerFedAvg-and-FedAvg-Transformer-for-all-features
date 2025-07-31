@@ -41,14 +41,9 @@ data:
 
 # 训练配置
 training:
-  max_epochs: 200      # 最大训练轮数
   early_stopping:
     patience: 15       # 早停耐心值
     min_delta: 0.001   # 最小改善阈值
-  lr_scheduler:
-    patience: 3        # 学习率调度器耐心值
-    factor: 0.7        # 学习率衰减因子
-    min_lr: 0.000001       # 最小学习率
 
 # 设备配置 (可选设备: cuda, mps, cpu)
 device:
@@ -56,7 +51,6 @@ device:
 
 # 日志配置
 logging:
-  log_interval: 100    # 日志记录间隔
   save_model: true     # 是否保存模型
   model_save_path: "checkpoints"
   log_level: "INFO"

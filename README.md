@@ -200,14 +200,9 @@ data:
 #### 訓練優化配置
 ```yaml
 training:
-  max_epochs: 200            # 最大訓練輪數
   early_stopping:
     patience: 15             # 早停耐心值
     min_delta: 0.001         # 最小改善閾值
-  lr_scheduler:
-    patience: 3              # 學習率調度耐心值
-    factor: 0.7              # 學習率衰減因子
-    min_lr: 0.000001         # 最小學習率
 ```
 
 #### 個性化測試配置
