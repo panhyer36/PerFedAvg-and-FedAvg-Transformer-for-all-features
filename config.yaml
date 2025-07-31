@@ -20,7 +20,7 @@ local_training:
 
 # 模型配置
 model:
-  feature_dim: 25      # 特征维度 (对应features列表中的16个特征)
+  feature_dim: 25      # 特征维度 
   d_model: 256         # Transformer模型维度
   nhead: 8             # 注意力头数
   num_layers: 4        # Transformer层数
