@@ -334,22 +334,29 @@ class Client:
                 # CUDA兼容性處理：在CUDA環境下禁用高效注意力機制
                 if self.device.type == 'cuda':
                     try:
-                        # 嘗試使用新版本的attention kernel API
+                        # 嘗試使用舊版本API（更穩定）
                         try:
-                            from torch.nn.attention import sdpa_kernel
-                            with sdpa_kernel(
-                                enable_flash=False,       # 禁用FlashAttention
-                                enable_math=True,         # 使用標準數學實現
-                                enable_mem_efficient=False  # 禁用內存高效實現
+                            with torch.backends.cuda.sdp_kernel(
+                                enable_flash=False,      # 禁用FlashAttention
+                                enable_math=True,        # 使用標準數學實現
+                                enable_mem_efficient=False,  # 禁用內存高效實現
+                                enable_cudnn=False       # 禁用cuDNN實現
                             ):
                                 hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False)
-                        except ImportError:
-                            # 回退到舊版本API
-                            with torch.backends.cuda.sdp_kernel(
-                                enable_flash=False,
-                                enable_math=True,
-                                enable_mem_efficient=False
-                            ):
+                        except AttributeError:
+                            # 如果舊版本API不可用，嘗試新版本
+                            try:
+                                from torch.nn.attention import sdpa_kernel, SDPBackend
+                                # 新版本API：只使用MATH backend
+                                backends = [SDPBackend.MATH] if hasattr(SDPBackend, 'MATH') else None
+                                if backends:
+                                    with sdpa_kernel(backends=backends):
+                                        hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False)
+                                else:
+                                    # 無法設置特定backend，直接計算
+                                    hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False)
+                            except (ImportError, AttributeError, TypeError):
+                                # 新舊版本都不可用，直接計算
                                 hvp_grads = torch.autograd.grad(loss_d_prime, params, retain_graph=False)
                     except (AttributeError, RuntimeError) as e:
                         # 如果遇到已知的CUDA注意力問題，回退到CPU計算
