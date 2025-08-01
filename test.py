@@ -17,6 +17,12 @@ Per-FedAvg 評估流程：
 - 使用 validation set 對全局模型進行個性化適應
 - 在完全未見過的 test set 上評估適應後的性能
 - 確保評估結果的公正性和可靠性
+- 與 FedAvg 使用完全相同的 targets，確保可比較性
+
+數據一致性保證：
+- 兩種算法的 targets 來自相同的 trainer.test_model() 方法
+- 完整的時間序列可視化，不進行隨機採樣
+- 確保評估結果的可靠性和公平比較
 
 """
 
@@ -295,38 +301,36 @@ def evaluate_model_personalized(model, dataset, config):
     support_inputs = torch.cat(support_inputs, dim=0)
     support_targets = torch.cat(support_targets, dim=0)
     
-    # 收集 test set 數據用於最終評估
-    query_inputs, query_targets = [], []
-    for inputs, targets in test_loader:
-        query_inputs.append(inputs)
-        query_targets.append(targets)
-    
-    if not query_inputs:
-        print(f"Warning: No test data available")
-        return evaluate_model_on_dataset(model, dataset, config)
-    
-    query_inputs = torch.cat(query_inputs, dim=0)
-    query_targets = torch.cat(query_targets, dim=0)
-    
     # 確保數據在正確的設備上（GPU/CPU）
     support_inputs = support_inputs.to(config.device)
     support_targets = support_targets.to(config.device)
-    query_inputs = query_inputs.to(config.device)
-    query_targets = query_targets.to(config.device)
     
     # 個性化適應：使用 validation set (support) 微調模型
     personalized_model = personalize_model(model, support_inputs, support_targets, config)
-    personalized_model.eval()  # 切換到評估模式
     
-    # 在 test set (query) 上評估個性化模型
-    with torch.no_grad():  # 評估時不需要梯度
-        predictions = personalized_model(query_inputs)
-        criterion = torch.nn.MSELoss()
-        test_loss = criterion(predictions, query_targets).item()
+    # 使用統一的 trainer.test_model 方法獲取 test set 結果
+    # 這確保與 FedAvg 評估使用完全相同的數據處理流程
+    test_loss, predictions_np, targets_np = trainer.test_model(test_loader)
     
-    # 轉換為 numpy 數組以計算 sklearn 指標
-    predictions_np = predictions.cpu().numpy().flatten()
-    targets_np = query_targets.cpu().numpy().flatten()
+    # 注意：上面的 test_loss 是使用原始全局模型計算的
+    # 我們需要用個性化模型重新計算 predictions，但保持相同的 targets
+    personalized_model.eval()
+    all_predictions = []
+    
+    with torch.no_grad():
+        for inputs, _ in test_loader:  # 我們只使用 inputs，targets 已經從 trainer.test_model 獲得
+            inputs = inputs.to(config.device)
+            outputs = personalized_model(inputs)
+            all_predictions.extend(outputs.cpu().numpy())
+    
+    # 使用個性化模型的預測結果，但保持與 FedAvg 完全相同的 targets
+    predictions_np = np.array(all_predictions)
+    
+    # 重新計算個性化模型的 test_loss
+    predictions_tensor = torch.tensor(predictions_np, device=config.device)
+    targets_tensor = torch.tensor(targets_np, device=config.device)
+    criterion = torch.nn.MSELoss()
+    test_loss = criterion(predictions_tensor, targets_tensor).item()
     
     # 計算評估指標
     mse = mean_squared_error(targets_np, predictions_np)
@@ -348,7 +352,7 @@ def evaluate_model_personalized(model, dataset, config):
         'predictions': predictions_np,
         'targets': targets_np,
         'support_size': len(support_inputs),  # validation set 大小（用於適應）
-        'query_size': len(query_inputs)       # test set 大小（用於評估）
+        'query_size': len(targets_np)         # test set 大小（用於評估）
     }
 
 def plot_predictions_vs_targets(predictions, targets, client_name, save_path):
@@ -405,52 +409,63 @@ def plot_predictions_vs_targets(predictions, targets, client_name, save_path):
     plt.close()  # 關閉圖形釋放內存
     print(f"Saved prediction plot to {plot_path}")
 
-def plot_time_series_comparison(predictions, targets, client_name, save_path, max_samples=200):
-    """繪製時間序列預測對比圖
+def plot_time_series_comparison(predictions, targets, client_name, save_path):
+    """繪製時間序列預測對比圖 - 顯示完整數據
     
     時序對比圖展示模型如何跟蹤時間序列的變化：
     - 可以觀察模型是否捕捉到趨勢和週期性
     - 發現預測的滯後或超前現象
     - 識別模型在哪些時間段表現較差
     
-    由於完整時序可能很長，我們隨機採樣一部分連續片段：
-    - 保持時間順序（排序後的索引）
-    - 限制最多顯示 200 個點以保持可讀性
+    完整數據顯示的優點：
+    - 不遺漏任何預測結果，提供完整視角
+    - 確保不同算法的可視化結果完全一致
+    - 能觀察到所有時間點的預測表現
+    - 便於發現局部的預測模式和異常
     
     Args:
         predictions: 預測值數組
         targets: 真實值數組
         client_name: 客戶端名稱
         save_path: 保存路徑
-        max_samples: 最大顯示樣本數（默認 200）
     """
-    # 限制樣本數量以便可視化
-    # 如果數據太多，圖形會過於密集難以解讀
-    n_samples = min(len(predictions), max_samples)
+    # 使用所有數據點，不進行採樣
+    n_samples = len(predictions)
     
-    # 隨機選擇樣本，但保持時間順序
-    idx = np.random.choice(len(predictions), n_samples, replace=False)
-    idx = np.sort(idx)  # 排序以保持時間順序
-    
-    plt.figure(figsize=(15, 6))  # 寬圖適合時間序列
+    # 根據數據量調整圖形尺寸
+    # 數據點越多，圖形越寬，便於觀察細節
+    fig_width = max(15, min(30, n_samples // 100))  # 動態調整寬度，最小15，最大30
+    plt.figure(figsize=(fig_width, 6))
     
     # 繪製真實值和預測值
-    plt.plot(range(n_samples), targets[idx], 
-             label='True Values', linewidth=1.5, alpha=0.8)
-    plt.plot(range(n_samples), predictions[idx], 
-             label='Predictions', linewidth=1.5, alpha=0.8)
+    plt.plot(range(n_samples), targets, 
+             label='True Values', linewidth=1.0, alpha=0.8)
+    plt.plot(range(n_samples), predictions, 
+             label='Predictions', linewidth=1.0, alpha=0.8)
     
     plt.xlabel('Time Steps')
     plt.ylabel('Values')
-    plt.title(f'Time Series Prediction Comparison - {client_name}')
+    plt.title(f'Complete Time Series Prediction Comparison - {client_name}')
     plt.legend()
     plt.grid(True, alpha=0.3)
     
+    # 添加統計信息到圖表
+    mse = np.mean((targets - predictions) ** 2)
+    mae = np.mean(np.abs(targets - predictions))
+    
+    # 在圖表右上角添加統計信息
+    stats_text = f'Total samples: {n_samples}\nMSE: {mse:.6f}\nMAE: {mae:.6f}'
+    plt.text(0.98, 0.98, stats_text,
+             transform=plt.gca().transAxes,
+             verticalalignment='top',
+             horizontalalignment='right',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
     plt.tight_layout()
-    plot_path = os.path.join(save_path, f'{client_name}_time_series.png')
+    plot_path = os.path.join(save_path, f'{client_name}_time_series_complete.png')
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"Saved time series plot to {plot_path}")
+    print(f"Saved complete time series plot to {plot_path} (showing all {n_samples} points)")
 
 def plot_attention_weights(model, dataset, client_name, save_path, config, num_samples=5):
     """可視化注意力權重
