@@ -227,26 +227,25 @@ class Client:
                 inputs_d_prime, labels_d_prime = inputs[split_idx:], labels[split_idx:]  # 查詢集
                 
                 # === 內迴圈：在支持集D上模擬快速適應 ===
-                # 創建臨時模型，避免影響原始模型參數
-                model_config = self._get_model_config()
-                temp_model = type(self.model)(**model_config).to(self.device)
-                temp_model.load_state_dict(self.model.state_dict())  # 複製當前參數
-                temp_model.train()
-                
-                # 在支持集上計算損失
-                outputs_d = temp_model(inputs_d)
+                # 計算支持集上的梯度（保持計算圖）
+                outputs_d = self.model(inputs_d)
                 loss_d = self.criterion(outputs_d, labels_d)
+                grads_d = torch.autograd.grad(
+                    loss_d, self.model.parameters(), 
+                    create_graph=True,  # 重要：保持計算圖用於二階梯度
+                    retain_graph=True
+                )
                 
-                # 計算梯度並執行一步適應更新
-                # 這模擬了客戶端收到全局模型後的個性化適應過程
-                grads = torch.autograd.grad(loss_d, temp_model.parameters())
-                for param, grad in zip(temp_model.parameters(), grads):
-                    param.data = param.data - meta_lr * grad  # θ' = θ - α∇L_D(θ)
+                # 計算虛擬更新後的參數（First-Order近似）
+                # θ' = θ - α∇L_D(θ)
+                adapted_params = []
+                for param, grad in zip(self.model.parameters(), grads_d):
+                    adapted_param = param - meta_lr * grad
+                    adapted_params.append(adapted_param)
                 
-                # === 外迴圈：評估適應效果並更新原始模型 ===
-                # 使用適應後的參數在查詢集上計算損失
-                outputs_d_prime = temp_model(inputs_d_prime)
-                loss_d_prime = self.criterion(outputs_d_prime, labels_d_prime)
+                # === 外迴圈：使用適應後參數計算查詢集損失 ===
+                # 使用functional_call在查詢集上計算損失（保持計算圖）
+                loss_d_prime = self._functional_forward(inputs_d_prime, labels_d_prime, adapted_params)
                 
                 # 關鍵：使用查詢集的損失來更新原始模型
                 # 這確保原始模型能學到好的初始化，使得一步適應後效果更好
