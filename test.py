@@ -2,15 +2,27 @@
 
 這個腳本提供了完整的模型測試和評估功能，支持：
 1. 標準 FedAvg 測試：直接在測試集上評估全局模型
-2. Per-FedAvg 個性化測試：使用 support/query 分割進行個性化適應後評估
+2. Per-FedAvg 個性化測試：使用 validation set 進行個性化適應，在 test set 上評估
 3. 多種性能指標計算：MSE、MAE、RMSE、R²、sMAPE
 4. 豐富的可視化功能：預測對比圖、時序圖、注意力權重圖等
 
 主要特點：
 - 自動識別算法類型（FedAvg vs Per-FedAvg）
+- 正確的數據分割：validation set 用於適應，test set 用於評估
 - 支持多客戶端批量測試
 - 生成詳細的性能報告和可視化結果
 - 保存測試結果到 CSV 文件便於後續分析
+
+Per-FedAvg 評估流程：
+- 使用 validation set 對全局模型進行個性化適應
+- 在完全未見過的 test set 上評估適應後的性能
+- 確保評估結果的公正性和可靠性
+- 與 FedAvg 使用完全相同的 targets，確保可比較性
+
+數據一致性保證：
+- 兩種算法的 targets 來自相同的 trainer.test_model() 方法
+- 完整的時間序列可視化，不進行隨機採樣
+- 確保評估結果的可靠性和公平比較
 
 """
 
@@ -132,83 +144,24 @@ def load_test_data(config):
     
     return test_datasets, test_names
 
-def split_test_data_for_personalization(test_loader, support_ratio=0.2):
-    """將測試數據分割為 support 和 query sets（Per-FedAvg 專用）
-    
-    Per-FedAvg 的核心思想是在測試時進行個性化適應：
-    1. Support Set：用於對全局模型進行個性化微調
-    2. Query Set：用於評估個性化後的模型性能
-    
-    這模擬了實際應用場景：
-    - 新客戶端加入時，先用少量本地數據（support）適應
-    - 然後在剩餘數據（query）上評估真實性能
-    
-    Args:
-        test_loader: 測試數據加載器
-        support_ratio: support set 佔比（默認 20%）
-        
-    Returns:
-        support_inputs: 用於個性化的輸入數據
-        support_targets: 用於個性化的目標數據
-        query_inputs: 用於評估的輸入數據
-        query_targets: 用於評估的目標數據
-        
-    Note:
-        - 使用隨機分割而非時序分割，因為這是在測試集內部的再分割
-        - 確保至少有 1 個樣本用於 support（處理小數據集情況）
-    """
-    all_inputs, all_targets = [], []
-    
-    # 收集所有批次的數據
-    for inputs, targets in test_loader:
-        all_inputs.append(inputs)
-        all_targets.append(targets)
-    
-    if not all_inputs:
-        return None, None, None, None
-    
-    # 合併所有批次為單個張量
-    all_inputs = torch.cat(all_inputs, dim=0)
-    all_targets = torch.cat(all_targets, dim=0)
-    
-    # 計算分割大小
-    total_samples = len(all_inputs)
-    support_size = int(total_samples * support_ratio)
-    
-    # 確保至少有一個樣本用於 support（處理極小數據集）
-    if support_size == 0:
-        support_size = min(1, total_samples)
-    
-    # 隨機打亂並分割
-    # 注意：這裡使用隨機分割是合理的，因為我們已經在測試集內部
-    indices = torch.randperm(total_samples)
-    support_indices = indices[:support_size]
-    query_indices = indices[support_size:]
-    
-    # 提取對應的數據
-    support_inputs = all_inputs[support_indices]
-    support_targets = all_targets[support_indices]
-    query_inputs = all_inputs[query_indices]
-    query_targets = all_targets[query_indices]
-    
-    return support_inputs, support_targets, query_inputs, query_targets
 
 def personalize_model(model, support_inputs, support_targets, config):
-    """使用 support set 對模型進行個性化適應
+    """使用 validation set 對模型進行個性化適應
     
     這是 Per-FedAvg 測試時的關鍵步驟：
     1. 複製全局模型（避免修改原始模型）
-    2. 在 support set 上進行幾步梯度下降
-    3. 返回個性化後的模型用於 query set 評估
+    2. 在 validation set 上進行幾步梯度下降適應
+    3. 返回個性化後的模型用於 test set 評估
     
-    與訓練時的元學習不同：
+    正確的個性化流程：
     - 訓練時：使用元學習優化「快速適應能力」
-    - 測試時：直接進行標準的梯度下降適應
+    - 測試時：使用 validation set 進行標準梯度下降適應
+    - 評估時：在完全未見過的 test set 上評估性能
     
     Args:
         model: 全局模型（將被複製，不會被修改）
-        support_inputs: 用於適應的輸入數據
-        support_targets: 用於適應的目標數據
+        support_inputs: validation set 輸入數據（用於適應）
+        support_targets: validation set 目標數據（用於適應）
         config: 配置對象，包含適應學習率和步數
         
     Returns:
@@ -308,60 +261,76 @@ def evaluate_model_personalized(model, dataset, config):
     """Per-FedAvg 個性化評估
     
     這是 Per-FedAvg 的核心評估方法，模擬實際應用場景：
-    1. 將測試集分為 support 和 query 兩部分
-    2. 使用 support set 對全局模型進行個性化適應
-    3. 在 query set 上評估個性化後的性能
+    1. 使用 validation set 對全局模型進行個性化適應
+    2. 在 test set 上評估個性化後的性能
     
     為什麼需要個性化評估？
     - FedAvg 產生的是「平均」模型，可能不適合特定客戶端
     - Per-FedAvg 訓練的模型具有「快速適應」能力
     - 個性化評估能真實反映模型在新客戶端上的表現
     
-    評估流程：
-    1. 獲取測試數據 → 2. 分割 support/query → 3. 個性化適應 → 4. 評估性能
+    正確的評估流程：
+    1. 使用 validation set 作為 support set 進行個性化適應
+    2. 在 test set 上評估適應後的模型性能
+    3. 確保 test set 從未被用於訓練或適應
     
     Args:
         model: Per-FedAvg 訓練的全局模型
         dataset: 客戶端數據集
-        config: 配置對象（包含 support_ratio、adaptation_lr 等）
+        config: 配置對象（包含 adaptation_lr、personalization_steps 等）
         
     Returns:
         dict: 評估結果，額外包含 support/query 大小信息
     """
-    # 準備數據
+    # 準備數據 - 分別獲取 validation 和 test 數據
     trainer = FederatedTrainer(model, config, config.device)
-    _, _, test_dataset = trainer.split_dataset(dataset)
-    _, _, test_loader = trainer.create_data_loaders(None, None, test_dataset)
+    _, val_dataset, test_dataset = trainer.split_dataset(dataset)
+    _, val_loader, test_loader = trainer.create_data_loaders(None, val_dataset, test_dataset)
     
-    # 分割測試數據為 support 和 query sets
-    support_inputs, support_targets, query_inputs, query_targets = split_test_data_for_personalization(
-        test_loader, config.support_ratio  # 通常設為 0.2（20% support，80% query）
-    )
+    # 使用 validation set 作為 support set 進行個性化適應
+    support_inputs, support_targets = [], []
+    for inputs, targets in val_loader:
+        support_inputs.append(inputs)
+        support_targets.append(targets)
     
-    # 處理數據不足的情況
-    if support_inputs is None or len(query_inputs) == 0:
-        print(f"Warning: Insufficient data for personalization, falling back to standard evaluation")
+    if not support_inputs:
+        print(f"Warning: No validation data available, falling back to standard evaluation")
         return evaluate_model_on_dataset(model, dataset, config)
+    
+    # 合併所有 validation 批次
+    support_inputs = torch.cat(support_inputs, dim=0)
+    support_targets = torch.cat(support_targets, dim=0)
     
     # 確保數據在正確的設備上（GPU/CPU）
     support_inputs = support_inputs.to(config.device)
     support_targets = support_targets.to(config.device)
-    query_inputs = query_inputs.to(config.device)
-    query_targets = query_targets.to(config.device)
     
-    # 個性化適應：使用 support set 微調模型
+    # 個性化適應：使用 validation set (support) 微調模型
     personalized_model = personalize_model(model, support_inputs, support_targets, config)
-    personalized_model.eval()  # 切換到評估模式
     
-    # 在 query set 上評估個性化模型
-    with torch.no_grad():  # 評估時不需要梯度
-        predictions = personalized_model(query_inputs)
-        criterion = torch.nn.MSELoss()
-        test_loss = criterion(predictions, query_targets).item()
+    # 使用統一的 trainer.test_model 方法獲取 test set 結果
+    # 這確保與 FedAvg 評估使用完全相同的數據處理流程
+    test_loss, predictions_np, targets_np = trainer.test_model(test_loader)
     
-    # 轉換為 numpy 數組以計算 sklearn 指標
-    predictions_np = predictions.cpu().numpy().flatten()
-    targets_np = query_targets.cpu().numpy().flatten()
+    # 注意：上面的 test_loss 是使用原始全局模型計算的
+    # 我們需要用個性化模型重新計算 predictions，但保持相同的 targets
+    personalized_model.eval()
+    all_predictions = []
+    
+    with torch.no_grad():
+        for inputs, _ in test_loader:  # 我們只使用 inputs，targets 已經從 trainer.test_model 獲得
+            inputs = inputs.to(config.device)
+            outputs = personalized_model(inputs)
+            all_predictions.extend(outputs.cpu().numpy())
+    
+    # 使用個性化模型的預測結果，但保持與 FedAvg 完全相同的 targets
+    predictions_np = np.array(all_predictions)
+    
+    # 重新計算個性化模型的 test_loss
+    predictions_tensor = torch.tensor(predictions_np, device=config.device)
+    targets_tensor = torch.tensor(targets_np, device=config.device)
+    criterion = torch.nn.MSELoss()
+    test_loss = criterion(predictions_tensor, targets_tensor).item()
     
     # 計算評估指標
     mse = mean_squared_error(targets_np, predictions_np)
@@ -382,8 +351,8 @@ def evaluate_model_personalized(model, dataset, config):
         'r2': r2,
         'predictions': predictions_np,
         'targets': targets_np,
-        'support_size': len(support_inputs),  # 記錄 support set 大小
-        'query_size': len(query_inputs)       # 記錄 query set 大小
+        'support_size': len(support_inputs),  # validation set 大小（用於適應）
+        'query_size': len(targets_np)         # test set 大小（用於評估）
     }
 
 def plot_predictions_vs_targets(predictions, targets, client_name, save_path):
@@ -440,52 +409,63 @@ def plot_predictions_vs_targets(predictions, targets, client_name, save_path):
     plt.close()  # 關閉圖形釋放內存
     print(f"Saved prediction plot to {plot_path}")
 
-def plot_time_series_comparison(predictions, targets, client_name, save_path, max_samples=200):
-    """繪製時間序列預測對比圖
+def plot_time_series_comparison(predictions, targets, client_name, save_path):
+    """繪製時間序列預測對比圖 - 顯示完整數據
     
     時序對比圖展示模型如何跟蹤時間序列的變化：
     - 可以觀察模型是否捕捉到趨勢和週期性
     - 發現預測的滯後或超前現象
     - 識別模型在哪些時間段表現較差
     
-    由於完整時序可能很長，我們隨機採樣一部分連續片段：
-    - 保持時間順序（排序後的索引）
-    - 限制最多顯示 200 個點以保持可讀性
+    完整數據顯示的優點：
+    - 不遺漏任何預測結果，提供完整視角
+    - 確保不同算法的可視化結果完全一致
+    - 能觀察到所有時間點的預測表現
+    - 便於發現局部的預測模式和異常
     
     Args:
         predictions: 預測值數組
         targets: 真實值數組
         client_name: 客戶端名稱
         save_path: 保存路徑
-        max_samples: 最大顯示樣本數（默認 200）
     """
-    # 限制樣本數量以便可視化
-    # 如果數據太多，圖形會過於密集難以解讀
-    n_samples = min(len(predictions), max_samples)
+    # 使用所有數據點，不進行採樣
+    n_samples = len(predictions)
     
-    # 隨機選擇樣本，但保持時間順序
-    idx = np.random.choice(len(predictions), n_samples, replace=False)
-    idx = np.sort(idx)  # 排序以保持時間順序
-    
-    plt.figure(figsize=(15, 6))  # 寬圖適合時間序列
+    # 根據數據量調整圖形尺寸
+    # 數據點越多，圖形越寬，便於觀察細節
+    fig_width = max(15, min(30, n_samples // 100))  # 動態調整寬度，最小15，最大30
+    plt.figure(figsize=(fig_width, 6))
     
     # 繪製真實值和預測值
-    plt.plot(range(n_samples), targets[idx], 
-             label='True Values', linewidth=1.5, alpha=0.8)
-    plt.plot(range(n_samples), predictions[idx], 
-             label='Predictions', linewidth=1.5, alpha=0.8)
+    plt.plot(range(n_samples), targets, 
+             label='True Values', linewidth=1.0, alpha=0.8)
+    plt.plot(range(n_samples), predictions, 
+             label='Predictions', linewidth=1.0, alpha=0.8)
     
     plt.xlabel('Time Steps')
     plt.ylabel('Values')
-    plt.title(f'Time Series Prediction Comparison - {client_name}')
+    plt.title(f'Complete Time Series Prediction Comparison - {client_name}')
     plt.legend()
     plt.grid(True, alpha=0.3)
     
+    # 添加統計信息到圖表
+    mse = np.mean((targets - predictions) ** 2)
+    mae = np.mean(np.abs(targets - predictions))
+    
+    # 在圖表右上角添加統計信息
+    stats_text = f'Total samples: {n_samples}\nMSE: {mse:.6f}\nMAE: {mae:.6f}'
+    plt.text(0.98, 0.98, stats_text,
+             transform=plt.gca().transAxes,
+             verticalalignment='top',
+             horizontalalignment='right',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
     plt.tight_layout()
-    plot_path = os.path.join(save_path, f'{client_name}_time_series.png')
+    plot_path = os.path.join(save_path, f'{client_name}_time_series_complete.png')
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"Saved time series plot to {plot_path}")
+    print(f"Saved complete time series plot to {plot_path} (showing all {n_samples} points)")
 
 def plot_attention_weights(model, dataset, client_name, save_path, config, num_samples=5):
     """可視化注意力權重
@@ -844,10 +824,10 @@ def main():
             print(f"  Using Per-FedAvg personalized evaluation...")
             result = evaluate_model_personalized(model, dataset, config)
             
-            # 顯示 support/query 分割信息
+            # 顯示 validation/test 集合大小信息
             if 'support_size' in result and 'query_size' in result:
-                print(f"  Support set size: {result['support_size']}, "
-                     f"Query set size: {result['query_size']}")
+                print(f"  Validation set size (for adaptation): {result['support_size']}, "
+                     f"Test set size (for evaluation): {result['query_size']}")
         else:
             # 標準 FedAvg 評估
             print(f"  Using standard FedAvg evaluation...")
