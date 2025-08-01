@@ -2,15 +2,21 @@
 
 這個腳本提供了完整的模型測試和評估功能，支持：
 1. 標準 FedAvg 測試：直接在測試集上評估全局模型
-2. Per-FedAvg 個性化測試：使用 support/query 分割進行個性化適應後評估
+2. Per-FedAvg 個性化測試：使用 validation set 進行個性化適應，在 test set 上評估
 3. 多種性能指標計算：MSE、MAE、RMSE、R²、sMAPE
 4. 豐富的可視化功能：預測對比圖、時序圖、注意力權重圖等
 
 主要特點：
 - 自動識別算法類型（FedAvg vs Per-FedAvg）
+- 正確的數據分割：validation set 用於適應，test set 用於評估
 - 支持多客戶端批量測試
 - 生成詳細的性能報告和可視化結果
 - 保存測試結果到 CSV 文件便於後續分析
+
+Per-FedAvg 評估流程：
+- 使用 validation set 對全局模型進行個性化適應
+- 在完全未見過的 test set 上評估適應後的性能
+- 確保評估結果的公正性和可靠性
 
 """
 
@@ -132,83 +138,24 @@ def load_test_data(config):
     
     return test_datasets, test_names
 
-def split_test_data_for_personalization(test_loader, support_ratio=0.2):
-    """將測試數據分割為 support 和 query sets（Per-FedAvg 專用）
-    
-    Per-FedAvg 的核心思想是在測試時進行個性化適應：
-    1. Support Set：用於對全局模型進行個性化微調
-    2. Query Set：用於評估個性化後的模型性能
-    
-    這模擬了實際應用場景：
-    - 新客戶端加入時，先用少量本地數據（support）適應
-    - 然後在剩餘數據（query）上評估真實性能
-    
-    Args:
-        test_loader: 測試數據加載器
-        support_ratio: support set 佔比（默認 20%）
-        
-    Returns:
-        support_inputs: 用於個性化的輸入數據
-        support_targets: 用於個性化的目標數據
-        query_inputs: 用於評估的輸入數據
-        query_targets: 用於評估的目標數據
-        
-    Note:
-        - 使用隨機分割而非時序分割，因為這是在測試集內部的再分割
-        - 確保至少有 1 個樣本用於 support（處理小數據集情況）
-    """
-    all_inputs, all_targets = [], []
-    
-    # 收集所有批次的數據
-    for inputs, targets in test_loader:
-        all_inputs.append(inputs)
-        all_targets.append(targets)
-    
-    if not all_inputs:
-        return None, None, None, None
-    
-    # 合併所有批次為單個張量
-    all_inputs = torch.cat(all_inputs, dim=0)
-    all_targets = torch.cat(all_targets, dim=0)
-    
-    # 計算分割大小
-    total_samples = len(all_inputs)
-    support_size = int(total_samples * support_ratio)
-    
-    # 確保至少有一個樣本用於 support（處理極小數據集）
-    if support_size == 0:
-        support_size = min(1, total_samples)
-    
-    # 隨機打亂並分割
-    # 注意：這裡使用隨機分割是合理的，因為我們已經在測試集內部
-    indices = torch.randperm(total_samples)
-    support_indices = indices[:support_size]
-    query_indices = indices[support_size:]
-    
-    # 提取對應的數據
-    support_inputs = all_inputs[support_indices]
-    support_targets = all_targets[support_indices]
-    query_inputs = all_inputs[query_indices]
-    query_targets = all_targets[query_indices]
-    
-    return support_inputs, support_targets, query_inputs, query_targets
 
 def personalize_model(model, support_inputs, support_targets, config):
-    """使用 support set 對模型進行個性化適應
+    """使用 validation set 對模型進行個性化適應
     
     這是 Per-FedAvg 測試時的關鍵步驟：
     1. 複製全局模型（避免修改原始模型）
-    2. 在 support set 上進行幾步梯度下降
-    3. 返回個性化後的模型用於 query set 評估
+    2. 在 validation set 上進行幾步梯度下降適應
+    3. 返回個性化後的模型用於 test set 評估
     
-    與訓練時的元學習不同：
+    正確的個性化流程：
     - 訓練時：使用元學習優化「快速適應能力」
-    - 測試時：直接進行標準的梯度下降適應
+    - 測試時：使用 validation set 進行標準梯度下降適應
+    - 評估時：在完全未見過的 test set 上評估性能
     
     Args:
         model: 全局模型（將被複製，不會被修改）
-        support_inputs: 用於適應的輸入數據
-        support_targets: 用於適應的目標數據
+        support_inputs: validation set 輸入數據（用於適應）
+        support_targets: validation set 目標數據（用於適應）
         config: 配置對象，包含適應學習率和步數
         
     Returns:
@@ -308,40 +255,58 @@ def evaluate_model_personalized(model, dataset, config):
     """Per-FedAvg 個性化評估
     
     這是 Per-FedAvg 的核心評估方法，模擬實際應用場景：
-    1. 將測試集分為 support 和 query 兩部分
-    2. 使用 support set 對全局模型進行個性化適應
-    3. 在 query set 上評估個性化後的性能
+    1. 使用 validation set 對全局模型進行個性化適應
+    2. 在 test set 上評估個性化後的性能
     
     為什麼需要個性化評估？
     - FedAvg 產生的是「平均」模型，可能不適合特定客戶端
     - Per-FedAvg 訓練的模型具有「快速適應」能力
     - 個性化評估能真實反映模型在新客戶端上的表現
     
-    評估流程：
-    1. 獲取測試數據 → 2. 分割 support/query → 3. 個性化適應 → 4. 評估性能
+    正確的評估流程：
+    1. 使用 validation set 作為 support set 進行個性化適應
+    2. 在 test set 上評估適應後的模型性能
+    3. 確保 test set 從未被用於訓練或適應
     
     Args:
         model: Per-FedAvg 訓練的全局模型
         dataset: 客戶端數據集
-        config: 配置對象（包含 support_ratio、adaptation_lr 等）
+        config: 配置對象（包含 adaptation_lr、personalization_steps 等）
         
     Returns:
         dict: 評估結果，額外包含 support/query 大小信息
     """
-    # 準備數據
+    # 準備數據 - 分別獲取 validation 和 test 數據
     trainer = FederatedTrainer(model, config, config.device)
-    _, _, test_dataset = trainer.split_dataset(dataset)
-    _, _, test_loader = trainer.create_data_loaders(None, None, test_dataset)
+    _, val_dataset, test_dataset = trainer.split_dataset(dataset)
+    _, val_loader, test_loader = trainer.create_data_loaders(None, val_dataset, test_dataset)
     
-    # 分割測試數據為 support 和 query sets
-    support_inputs, support_targets, query_inputs, query_targets = split_test_data_for_personalization(
-        test_loader, config.support_ratio  # 通常設為 0.2（20% support，80% query）
-    )
+    # 使用 validation set 作為 support set 進行個性化適應
+    support_inputs, support_targets = [], []
+    for inputs, targets in val_loader:
+        support_inputs.append(inputs)
+        support_targets.append(targets)
     
-    # 處理數據不足的情況
-    if support_inputs is None or len(query_inputs) == 0:
-        print(f"Warning: Insufficient data for personalization, falling back to standard evaluation")
+    if not support_inputs:
+        print(f"Warning: No validation data available, falling back to standard evaluation")
         return evaluate_model_on_dataset(model, dataset, config)
+    
+    # 合併所有 validation 批次
+    support_inputs = torch.cat(support_inputs, dim=0)
+    support_targets = torch.cat(support_targets, dim=0)
+    
+    # 收集 test set 數據用於最終評估
+    query_inputs, query_targets = [], []
+    for inputs, targets in test_loader:
+        query_inputs.append(inputs)
+        query_targets.append(targets)
+    
+    if not query_inputs:
+        print(f"Warning: No test data available")
+        return evaluate_model_on_dataset(model, dataset, config)
+    
+    query_inputs = torch.cat(query_inputs, dim=0)
+    query_targets = torch.cat(query_targets, dim=0)
     
     # 確保數據在正確的設備上（GPU/CPU）
     support_inputs = support_inputs.to(config.device)
@@ -349,11 +314,11 @@ def evaluate_model_personalized(model, dataset, config):
     query_inputs = query_inputs.to(config.device)
     query_targets = query_targets.to(config.device)
     
-    # 個性化適應：使用 support set 微調模型
+    # 個性化適應：使用 validation set (support) 微調模型
     personalized_model = personalize_model(model, support_inputs, support_targets, config)
     personalized_model.eval()  # 切換到評估模式
     
-    # 在 query set 上評估個性化模型
+    # 在 test set (query) 上評估個性化模型
     with torch.no_grad():  # 評估時不需要梯度
         predictions = personalized_model(query_inputs)
         criterion = torch.nn.MSELoss()
@@ -382,8 +347,8 @@ def evaluate_model_personalized(model, dataset, config):
         'r2': r2,
         'predictions': predictions_np,
         'targets': targets_np,
-        'support_size': len(support_inputs),  # 記錄 support set 大小
-        'query_size': len(query_inputs)       # 記錄 query set 大小
+        'support_size': len(support_inputs),  # validation set 大小（用於適應）
+        'query_size': len(query_inputs)       # test set 大小（用於評估）
     }
 
 def plot_predictions_vs_targets(predictions, targets, client_name, save_path):
@@ -844,10 +809,10 @@ def main():
             print(f"  Using Per-FedAvg personalized evaluation...")
             result = evaluate_model_personalized(model, dataset, config)
             
-            # 顯示 support/query 分割信息
+            # 顯示 validation/test 集合大小信息
             if 'support_size' in result and 'query_size' in result:
-                print(f"  Support set size: {result['support_size']}, "
-                     f"Query set size: {result['query_size']}")
+                print(f"  Validation set size (for adaptation): {result['support_size']}, "
+                     f"Test set size (for evaluation): {result['query_size']}")
         else:
             # 標準 FedAvg 評估
             print(f"  Using standard FedAvg evaluation...")
