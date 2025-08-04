@@ -228,13 +228,23 @@ class Client:
                 
                 # === 內迴圈：在支持集D上模擬快速適應 ===
                 # 計算支持集上的梯度（保持計算圖）
-                outputs_d = self.model(inputs_d)
-                loss_d = self.criterion(outputs_d, labels_d)
-                grads_d = torch.autograd.grad(
-                    loss_d, self.model.parameters(), 
-                    create_graph=True,  # 重要：保持計算圖用於二階梯度
-                    retain_graph=True
-                )
+                # 使用注意力context manager確保CUDA兼容性
+                attention_ctx = self._get_attention_context_manager()
+                
+                def _compute_support_loss():
+                    outputs_d = self.model(inputs_d)
+                    loss_d = self.criterion(outputs_d, labels_d)
+                    return torch.autograd.grad(
+                        loss_d, self.model.parameters(), 
+                        create_graph=True,  # 重要：保持計算圖用於二階梯度
+                        retain_graph=True
+                    )
+                
+                if attention_ctx is not None:
+                    with attention_ctx:
+                        grads_d = _compute_support_loss()
+                else:
+                    grads_d = _compute_support_loss()
                 
                 # 計算虛擬更新後的參數（First-Order近似）
                 # θ' = θ - α∇L_D(θ)
