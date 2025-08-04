@@ -436,8 +436,19 @@ class Client:
         # functional_call(model, param_dict, inputs) 等價於：
         # 臨時將model的參數替換為param_dict中的值，然後執行model(inputs)
         # 但保持計算圖完整，不實際修改model的狀態
-        outputs = func.functional_call(self.model, param_dict, inputs)
-        loss = self.criterion(outputs, labels)
+        
+        # 使用注意力context manager確保CUDA兼容性
+        attention_ctx = self._get_attention_context_manager()
+        
+        def _functional_call():
+            outputs = func.functional_call(self.model, param_dict, inputs)
+            return self.criterion(outputs, labels)
+        
+        if attention_ctx is not None:
+            with attention_ctx:
+                loss = _functional_call()
+        else:
+            loss = _functional_call()
         
         return loss  # 此損失可以對原始參數θ求導！
     
