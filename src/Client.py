@@ -244,14 +244,23 @@ class Client:
                     adapted_params.append(adapted_param)
                 
                 # === 外迴圈：使用適應後參數計算查詢集損失 ===
-                # 使用functional_call在查詢集上計算損失（保持計算圖）
-                loss_d_prime = self._functional_forward(inputs_d_prime, labels_d_prime, adapted_params)
+                # 使用注意力context manager確保CUDA兼容性
+                attention_ctx = self._get_attention_context_manager()
                 
-                # 關鍵：使用查詢集的損失來更新原始模型
-                # 這確保原始模型能學到好的初始化，使得一步適應後效果更好
-                optimizer.zero_grad()
-                loss_d_prime.backward()  # ∇L_D'(θ') 對原始參數θ的梯度
-                optimizer.step()
+                def _compute_query_loss():
+                    loss_d_prime = self._functional_forward(inputs_d_prime, labels_d_prime, adapted_params)
+                    
+                    # 關鍵：使用查詢集的損失來更新原始模型
+                    # 這確保原始模型能學到好的初始化，使得一步適應後效果更好
+                    optimizer.zero_grad()
+                    loss_d_prime.backward()  # ∇L_D'(θ') 對原始參數θ的梯度
+                    optimizer.step()
+                
+                if attention_ctx is not None:
+                    with attention_ctx:
+                        _compute_query_loss()
+                else:
+                    _compute_query_loss()
         
         return self.model.state_dict()
     
