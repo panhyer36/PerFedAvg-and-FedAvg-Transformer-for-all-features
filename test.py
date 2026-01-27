@@ -235,8 +235,12 @@ def evaluate_model_on_dataset(model, dataset, config):
     
     # 使用 trainer 的測試方法進行評估
     test_loss, predictions, targets = trainer.test_model(test_loader)
-    
-    # 計算評估指標
+
+    # 反標準化到原始尺度（與 VFL 一致，便於公平比較）
+    predictions = dataset.inverse_transform_output(predictions).flatten()
+    targets = dataset.inverse_transform_output(targets).flatten()
+
+    # 計算評估指標（原始尺度）
     mse = mean_squared_error(targets, predictions)
     mae = mean_absolute_error(targets, predictions)
     rmse = np.sqrt(mse)
@@ -326,13 +330,17 @@ def evaluate_model_personalized(model, dataset, config):
     # 使用個性化模型的預測結果，但保持與 FedAvg 完全相同的 targets
     predictions_np = np.array(all_predictions)
     
-    # 重新計算個性化模型的 test_loss
+    # 重新計算個性化模型的 test_loss（在標準化空間，與訓練一致）
     predictions_tensor = torch.tensor(predictions_np, device=config.device)
     targets_tensor = torch.tensor(targets_np, device=config.device)
     criterion = torch.nn.MSELoss()
     test_loss = criterion(predictions_tensor, targets_tensor).item()
-    
-    # 計算評估指標
+
+    # 反標準化到原始尺度（與 VFL 一致，便於公平比較）
+    predictions_np = dataset.inverse_transform_output(predictions_np).flatten()
+    targets_np = dataset.inverse_transform_output(targets_np).flatten()
+
+    # 計算評估指標（原始尺度）
     mse = mean_squared_error(targets_np, predictions_np)
     mae = mean_absolute_error(targets_np, predictions_np)
     rmse = np.sqrt(mse)
